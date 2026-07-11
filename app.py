@@ -5,11 +5,21 @@ import requests
 from datetime import datetime
 
 # -------------------------------------------------------------
-# 1. API 인증 정보 및 기본 설정 (st.secrets 적용)
+# 1. API 인증 정보 및 기본 설정 (st.secrets 예외 처리 적용)
 # -------------------------------------------------------------
-# Streamlit secrets에서 클라이언트 ID와 시크릿 불러오기
-CLIENT_ID = st.secrets["OPENSKY_ID"]
-CLIENT_SECRET = st.secrets["OPENSKY_CLIENT"]
+try:
+    CLIENT_ID = st.secrets["OPENSKY_ID"]
+    CLIENT_SECRET = st.secrets["OPENSKY_CLIENT"]
+except KeyError:
+    # 키가 없을 경우 직관적인 에러 메시지를 띄우고 앱 실행을 중단합니다.
+    st.error("🚨 보안 설정 오류: Streamlit Secrets에 `OPENSKY_ID` 또는 `OPENSKY_CLIENT`가 설정되지 않았습니다.")
+    st.info("💡 해결 방법: 로컬 환경에서는 `.streamlit/secrets.toml` 파일을, Streamlit Cloud에서는 앱 설정의 'Secrets' 메뉴를 확인해 주세요.")
+    st.stop() # 더 이상 아래 코드를 실행하지 않고 멈춤
+
+# 만약 키는 있지만 비어있는 문자열("")일 경우를 대비한 방어 코드
+if not CLIENT_ID or not CLIENT_SECRET:
+    st.error("🚨 인증 정보 오류: `OPENSKY_ID` 또는 `OPENSKY_CLIENT`의 값이 비어 있습니다. 값을 정확히 입력해 주세요.")
+    st.stop()
 
 TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
 API_URL = "https://opensky-network.org/api/states/all"
