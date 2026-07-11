@@ -29,7 +29,7 @@ def fetch_flight_data():
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET,
         }
-        token_response = requests.post(TOKEN_URL, data=token_payload, timeout=15)
+        token_response = requests.post(TOKEN_URL, data=token_payload, timeout=300)
         token_response.raise_for_status()
         access_token = token_response.json().get("access_token")
         
