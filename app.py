@@ -1,4 +1,3 @@
-# vibe coding 할것
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,10 +5,11 @@ import requests
 from datetime import datetime
 
 # -------------------------------------------------------------
-# 1. API 인증 정보 및 기본 설정
+# 1. API 인증 정보 및 기본 설정 (st.secrets 적용)
 # -------------------------------------------------------------
-CLIENT_ID = ""
-CLIENT_SECRET = ""
+# Streamlit secrets에서 클라이언트 ID와 시크릿 불러오기
+CLIENT_ID = st.secrets["OPENSKY_ID"]
+CLIENT_SECRET = st.secrets["OPENSKY_CLIENT"]
 
 TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
 API_URL = "https://opensky-network.org/api/states/all"
