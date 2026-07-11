@@ -1,147 +1,177 @@
-# vibe coding 할것
 import streamlit as st
 import pandas as pd
-import requests
-import pydeck as pdk
 import numpy as np
+import requests
+from datetime import datetime
 
-st.set_page_config(page_title="한반도 실시간 비행기 추적", layout="wide")
+# -------------------------------------------------------------
+# 1. API 인증 정보 및 기본 설정 (st.secrets 예외 처리 적용)
+# -------------------------------------------------------------
+try:
+    CLIENT_ID = st.secrets["OPENSKY_ID"]
+    CLIENT_SECRET = st.secrets["OPENSKY_CLIENT"]
+except KeyError:
+    # 키가 없을 경우 직관적인 에러 메시지를 띄우고 앱 실행을 중단합니다.
+    st.error("🚨 보안 설정 오류: Streamlit Secrets에 `OPENSKY_ID` 또는 `OPENSKY_CLIENT`가 설정되지 않았습니다.")
+    st.info("💡 해결 방법: 로컬 환경에서는 `.streamlit/secrets.toml` 파일을, Streamlit Cloud에서는 앱 설정의 'Secrets' 메뉴를 확인해 주세요.")
+    st.stop() # 더 이상 아래 코드를 실행하지 않고 멈춤
 
-st.title("✈️ 한반도 상공 실시간 비행기 이상 탐지 웹앱")
-st.write("OpenSky API 데이터에 Z-score 통계 기법을 적용하여 급강하 중인 비행기를 자동으로 감지합니다.")
+# 만약 키는 있지만 비어있는 문자열("")일 경우를 대비한 방어 코드
+if not CLIENT_ID or not CLIENT_SECRET:
+    st.error("🚨 인증 정보 오류: `OPENSKY_ID` 또는 `OPENSKY_CLIENT`의 값이 비어 있습니다. 값을 정확히 입력해 주세요.")
+    st.stop()
 
-# -----------------------------------------------------------
-# 1. 사이드바 UI 설정 (슬라이더 추가)
-# -----------------------------------------------------------
-st.sidebar.header("⚙️ 컨트롤 타워")
-refresh_button = st.sidebar.button("🔄 실시간 데이터 새로고침")
+TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
+API_URL = "https://opensky-network.org/api/states/all"
+KOREA_BOUNDS = {"lamin": 33.0, "lamax": 39.0, "lomin": 124.0, "lomax": 132.0}
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("🚨 이상 탐지(Anomaly Detection) 설정")
+st.set_page_config(page_title="한반도 실시간 항공기 레이더", page_icon="✈️", layout="wide")
 
-# 사용자가 직접 Z-score 기준값을 조절할 수 있는 슬라이더를 만듭니다.
-# 기본값은 통계학적 기준인 -3.0으로 설정합니다.
-z_threshold = st.sidebar.slider(
-    "급강하 감지 Z-score 기준값",
-    min_value=-5.0,
-    max_value=5.0,
-    value=-3.0,
-    step=0.1
-)
-
-# -----------------------------------------------------------
-# 2. 데이터 수집 (OpenSky API)
-# -----------------------------------------------------------
-def get_flight_data():
-    url = "https://opensky-network.org/api/states/all"
-    params = {"lamin": 33.0, "lamax": 39.0, "lomin": 124.0, "lomax": 132.0}
+# -------------------------------------------------------------
+# 2. 데이터 수집 함수 (가상 데이터 제거, 상세 에러 반환)
+# -------------------------------------------------------------
+@st.cache_data(ttl=10)
+def fetch_flight_data():
     try:
-        response = requests.get(url, params=params, timeout=10)
+        # [OAuth2 인증 단계]
+        token_payload = {
+            "grant_type": "client_credentials",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        }
+        token_response = requests.post(TOKEN_URL, data=token_payload, timeout=30)
+        token_response.raise_for_status()
+        access_token = token_response.json().get("access_token")
+        # [데이터 조회 단계]
+        headers = {"Authorization": f"Bearer {access_token}"}
+        # response = requests.get(API_URL, params=KOREA_BOUNDS, headers=headers, timeout=15)
+        
+        response = requests.get(API_URL, params=KOREA_BOUNDS, timeout=15)
+
+        response.raise_for_status()
         data = response.json()
-        if data is not None and data.get("states") is not None:
-            return data["states"]
-        return []
+        
+        if data and data.get("states"):
+            columns = [
+                "icao24", "callsign", "origin_country", "time_position", "last_contact",
+                "longitude", "latitude", "baro_altitude", "on_ground", "velocity",
+                "true_track", "vertical_rate", "sensors", "geo_altitude", "squawk", "spi", "position_source"
+            ]
+            df = pd.DataFrame(data["states"], columns=columns)
+            return df, None # 성공 시: 데이터프레임 반환, 에러 메시지 없음
+        else:
+            return pd.DataFrame(), None # 비행기가 없는 경우
+            
+    # 에러 발생 시 상세한 이유를 잡아냅니다.
+    except requests.exceptions.HTTPError as e:
+        error_detail = e.response.text if e.response else '응답 내용 없음'
+        error_msg = f"HTTP 에러 (상태 코드 오류):\n{e}\n\n[서버 응답 상세]:\n{error_detail}"
+        return None, error_msg
+    except requests.exceptions.Timeout as e:
+        error_msg = f"네트워크 타임아웃 에러 (서버 응답 없음):\n{e}"
+        return None, error_msg
+    except requests.exceptions.RequestException as e:
+        error_msg = f"네트워크 연결 에러:\n{e}"
+        return None, error_msg
     except Exception as e:
-        st.error(f"데이터를 가져오는 중 오류가 발생했습니다: {e}")
-        return []
+        error_msg = f"알 수 없는 시스템 에러:\n{e}"
+        return None, error_msg
 
-raw_data = get_flight_data()
+# -------------------------------------------------------------
+# 3. 데이터 전처리 및 Z-score 이상탐지 함수 (슬라이더 값 연동)
+# -------------------------------------------------------------
+def process_data(df, z_threshold):
+    if df is None or df.empty:
+        return df
+        
+    if "on_ground" in df.columns:
+        df = df[df["on_ground"] == False]
+    df = df.dropna(subset=["latitude", "longitude", "vertical_rate"])
+    
+    if len(df) < 3:
+        df["status"] = "정상"
+        df["color"] = "#0000FF"
+        return df
 
-# -----------------------------------------------------------
-# 3. 데이터 전처리 및 Z-score 계산 (Pandas)
-# -----------------------------------------------------------
-if len(raw_data) > 0:
-    columns = [
-        'icao24', 'callsign', 'origin_country', 'time_position', 'last_contact',
-        'longitude', 'latitude', 'baro_altitude', 'on_ground', 'velocity',
-        'true_track', 'vertical_rate', 'sensors', 'geo_altitude', 'squawk', 'spi', 'position_source'
-    ]
-    df = pd.DataFrame(raw_data, columns=columns)
-   
-    # [수정] 수직 속도(vertical_rate)를 데이터 분석 대상에 포함시킵니다.
-    df = df[['callsign', 'longitude', 'latitude', 'baro_altitude', 'velocity', 'vertical_rate']]
-   
-    # 위치 정보와 수직 속도가 없는 데이터는 지워줍니다.
-    df = df.dropna(subset=['longitude', 'latitude', 'vertical_rate'])
-    df['callsign'] = df['callsign'].astype(str).str.strip().replace('', '알 수 없음')
+    v_mean = df["vertical_rate"].mean()
+    v_std = df["vertical_rate"].std()
+    
+    if pd.isna(v_std) or v_std == 0:
+        v_std = 0.0001
+        
+    df["z_score"] = (df["vertical_rate"] - v_mean) / v_std
+    
+    # 전달받은 z_threshold(슬라이더 값)를 기준으로 위험 분류
+    df["status"] = np.where(df["z_score"] <= z_threshold, "위험(급강하)", "정상")
+    df["color"] = np.where(df["status"] == "위험(급강하)", "#FF0000", "#0000FF") 
+    
+    return df
 
-    # --- [핵심 기능] Z-score 계산 ---
-    # 현재 한반도 상공 모든 비행기의 수직 속도 평균(mean)과 표준편차(std)를 구합니다.
-    mean_vr = df['vertical_rate'].mean()
-    std_vr = df['vertical_rate'].std()
-   
-    # 만약 비행기가 너무 적어서 표준편차가 0이 되는 경우를 대비한 안전 장치입니다.
-    if std_vr > 0:
-        df['z_score'] = (df['vertical_rate'] - mean_vr) / std_vr
+# -------------------------------------------------------------
+# 4. Streamlit 메인 화면 및 사이드바 구성
+# -------------------------------------------------------------
+# [사이드바 설정] Z-score 슬라이더 추가
+with st.sidebar:
+    st.header("⚙️ 이상탐지 설정")
+    st.markdown("급강하를 판별할 통계적 기준(Z-score)을 조절하세요.")
+    # 기본값 -3.0, 범위는 -5.0에서 0.0까지 0.1 단위로 조절 가능
+    user_z_threshold = st.slider("급강하 감지 Z-score 기준값", min_value=-5.0, max_value=0.0, value=-3.0, step=0.1)
+    st.caption("💡 0에 가까울수록 기준이 엄격해져 많은 비행기가 위험으로 감지되고, -5에 가까울수록 극단적인 하강만 잡아냅니다.")
+
+# [메인 화면]
+st.title("✈️ 한반도 실시간 항공기 모니터링 레이더")
+st.markdown("OpenSky Network 실제 데이터를 활용하여 **Z-score 기반 급강하 이상탐지**를 수행합니다.")
+st.markdown("---")
+
+if st.button("🔄 실시간 레이더 업데이트", use_container_width=True):
+    st.cache_data.clear()
+
+with st.spinner("OpenSky API 서버와 통신 중입니다... 📡"):
+    # 데이터와 에러 메시지를 동시에 받아옵니다.
+    raw_df, error_msg = fetch_flight_data()
+    
+    # 에러가 발생한 경우 (가상 데이터 없이 무조건 에러 화면 출력)
+    if error_msg:
+        st.error("🚨 API 데이터를 가져오지 못했습니다.")
+        # 코드를 블록 처리하여 상세 에러를 가독성 있게 보여줍니다.
+        st.code(error_msg, language="bash")
+        st.info("💡 팁: 'Max retries exceeded' 또는 'timed out' 메시지가 보인다면 코랩 IP 차단이나 사내망 방화벽 문제일 확률이 99%입니다. 로컬 PC 환경이나 핫스팟으로 변경해 보세요.")
+    
+    # 에러 없이 정상적으로 데이터가 들어온 경우
     else:
-        df['z_score'] = 0.0
+        # 슬라이더에서 받은 user_z_threshold 값을 전처리 함수에 전달
+        clean_df = process_data(raw_df, user_z_threshold)
 
-    # 사용자가 설정한 슬라이더 기준값(z_threshold) 이하이면 '위험(급강하)', 아니면 '정상'으로 분류합니다.
-    df['status'] = df['z_score'].apply(lambda z: '위험(급강하)' if z <= z_threshold else '정상')
+        if clean_df is None or clean_df.empty:
+            st.info("ℹ️ 현재 한반도 상공에 감지된 비행기가 없습니다.")
+        else:
+            st.caption(f"✓ 실제 API 데이터 | 최종 수신 시각: {datetime.now().strftime('%H:%M:%S')}")
+            
+            danger_count = len(clean_df[clean_df["status"] == "위험(급강하)"])
+            col1, col2, col3 = st.columns(3)
+            col1.metric("📡 포착된 상공 항공기", f"{len(clean_df)} 대")
+            col2.metric("☁️ 최고 비행 고도", f"{clean_df['baro_altitude'].max():,.0f} m")
+            col3.metric(f"🚨 급강하 위험 (Z<={user_z_threshold})", f"{danger_count} 대", delta_color="inverse" if danger_count > 0 else "normal")
 
-    # --- [시각화 꿀팁] 상태에 따른 색상 부여 ---
-    # 정상 비행기는 노란색[255, 200, 0], 위험 비행기는 빨간색[255, 0, 0]으로 지정합니다.
-    def assign_color(status):
-        if status == '위험(급강하)':
-            return [255, 0, 0, 255] # 빨간색 (R, G, B, A)
-        return [255, 200, 0, 180]    # 노란색
-       
-    df['color'] = df['status'].apply(assign_color)
+            st.markdown("<br>", unsafe_allow_html=True)
 
-    # 대시보드 요약 정보 표시
-    diving_count = len(df[df['status'] == '위험(급강하)'])
-    st.sidebar.success(f"현재 추적 비행기: {len(df)}대")
-    if diving_count > 0:
-        st.sidebar.error(f"⚠️ 급강하 감지: {diving_count}대!!")
-    else:
-        st.sidebar.info("✅ 현재 특이 이상 징후 없음")
-
-    # -----------------------------------------------------------
-    # 4. Pydeck 3D 지도 시각화
-    # -----------------------------------------------------------
-    view_state = pdk.ViewState(latitude=36.0, longitude=128.0, zoom=6, pitch=45)
-
-    # [수정] get_fill_color에 고정된 값이 아닌, 위에서 우리가 만든 'color' 컬럼을 연동합니다.
-    layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=df,
-        get_position="[longitude, latitude]",
-        get_radius=6000,
-        get_fill_color="color",
-        pickable=True
-    )
-
-    # 툴팁에 Z-score와 현재 상태, 수직속도 정보를 추가하여 사용자가 확인할 수 있게 합니다.
-    tooltip = {
-        "html": """
-        <b>콜사인:</b> {callsign} <br/>
-        <b>상태:</b> {status} <br/>
-        <b>수직 속도:</b> {vertical_rate} m/s <br/>
-        <b>Z-score:</b> {z_score} <br/>
-        <b>현재 고도:</b> {baro_altitude} m
-        """,
-        "style": {"backgroundColor": "black", "color": "white"}
-    }
-
-    r = pdk.Deck(
-        layers=[layer],
-        initial_view_state=view_state,
-        tooltip=tooltip,
-        map_style="dark"
-    )
-
-    st.pydeck_chart(r)
-   
-    # -----------------------------------------------------------
-    # 5. 데이터 테이블 확인
-    # -----------------------------------------------------------
-    st.subheader("📊 실시간 항공 통계 및 데이터")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric(label="평균 수직 속도", value=f"{mean_vr:.2f} m/s")
-    with col2:
-        st.metric(label="수직 속도 표준편차", value=f"{std_vr:.2f}")
-       
-    st.dataframe(df[['callsign', 'status', 'z_score', 'vertical_rate', 'baro_altitude', 'velocity']])
-else:
-    st.warning("현재 한반도 상공에서 감지된 비행기 데이터가 없습니다. (잠시 후 다시 시도해보세요)")
+            map_col, table_col = st.columns([1.5, 1], gap="large")
+            
+            with map_col:
+                st.subheader("🗺️ 실시간 레이더 맵")
+                st.map(clean_df, latitude="latitude", longitude="longitude", color="color", size=60)
+                
+            with table_col:
+                st.subheader("📊 상세 비행 정보")
+                display_cols = ["callsign", "vertical_rate", "z_score", "status"]
+                st.dataframe(
+                    clean_df[display_cols],
+                    column_config={
+                        "callsign": "항공편명",
+                        "vertical_rate": st.column_config.NumberColumn("수직속도", format="%.1f m/s"),
+                        "z_score": st.column_config.NumberColumn("Z-Score", format="%.2f"),
+                        "status": "상태"
+                    },
+                    use_container_width=True,
+                    height=450
+                )
